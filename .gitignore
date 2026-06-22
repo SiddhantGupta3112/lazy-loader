@@ -1,0 +1,9 @@
+python-lazy-loader-env/
+sample_project/
+tests.py
+tests/
+
+**/__pycache__/
+**/.chunks/
+dist/
+*.egg-info/
