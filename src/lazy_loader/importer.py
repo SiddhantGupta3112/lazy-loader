@@ -82,40 +82,29 @@ class ChunkModuleLoader(Loader):
             chunk_data = self.chunk_cache[chunk_file]
 
         sources = chunk_data["sources"]
-        executed = chunk_data["executed"]
 
-        # --- STEP 2: REGISTER ALL SILENT STUBS FIRST ---
-        # Populate sys.modules using our smart Lazy Sibling proxy wrappers.
-        # This completely visualizes all file targets before a single line executes.
+        # --- STEP 2: REGISTER ALL CHUNK MODULES AS LAZY PROXIES ---
+        # Include the requested_name here as well!
         for name in sources.keys():
-            if name == requested_name:
-                continue
-            if name not in sys.modules:
-                sys.modules[name] = LazySiblingModule(name, chunk_file, self.chunk_cache, self.base_dir)
-            
-            sibling_mod = sys.modules[name]
-            if not getattr(sibling_mod, "__file__", None):
+            if name not in sys.modules or not isinstance(sys.modules[name], LazySiblingModule):
+                lazy_mod = LazySiblingModule(name, chunk_file, self.chunk_cache, self.base_dir)
+                
+                # Setup basic file layouts safely on the proxy dictionary
                 relative_src_path = name.replace(".", "/") + ".py"
-                sibling_mod.__file__ = str(self.base_dir / relative_src_path)
+                lazy_mod.__dict__["__file__"] = str(self.base_dir / relative_src_path)
+                
+                # Override sys.modules so downstream systems hit the proxy
+                sys.modules[name] = lazy_mod
 
-        if requested_name not in sys.modules or sys.modules[requested_name] is not module:
-            sys.modules[requested_name] = module
-
-        if not getattr(module, "__file__", None):
-            relative_src_path = requested_name.replace(".", "/") + ".py"
-            module.__file__ = str(self.base_dir / relative_src_path)
-
-        # --- STEP 3: EXECUTE TARGET REQUESTED MODULE ENTRY ---
-        # Sibling files will now smoothly execute themselves in exact topological order
-        # when triggered by the core execution below.
-        if requested_name not in executed:
-            executed.add(requested_name)
-            requested_source = sources[requested_name]
-            filename = module.__file__ or f"<chunked_source:{requested_name}>"
-            
-            bytecode = compile(requested_source, filename, 'exec')
-            exec(bytecode, module.__dict__)
-
+        # --- STEP 3: CONVERT CURRENT MODULE INSTANCE INTO A PROXY ---
+        # Dynamically mutation-morph Python's target module object into your proxy type
+        # so it behaves lazily when benchmark.py tries to read from it!
+        module.__class__ = LazySiblingModule
+        module.__dict__["_chunk_file"] = chunk_file
+        module.__dict__["_chunk_cache"] = self.chunk_cache
+        module.__dict__["_base_dir"] = self.base_dir
+        
+        # 🎯 NO MORE exec(bytecode) HERE! Let the attribute request trigger it.
 
 class ChunkMetaPathFinder(MetaPathFinder):
     def __init__(self, base_dir: Path):
