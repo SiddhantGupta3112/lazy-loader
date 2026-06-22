@@ -9,11 +9,12 @@ authors = [
     { name="Siddhant Gupta", email="siddhant051231@gmail.com" }
 ]
 description = "A smart topological chunking compiler and lazy loader for Python modules."
-readme = "ReadMe.md"
+readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries :: Python Modules"
@@ -23,7 +24,11 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/yourusername/lazy-loader-lib"
+"Homepage" = "https://github.com/SiddhantGupta3112/lazy-loader"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Force setuptools to ignore the root tests/ folder completely in all archives
+[tool.setuptools.exclude-package-data]
+"*" = ["tests*", "tests/**/*"]
