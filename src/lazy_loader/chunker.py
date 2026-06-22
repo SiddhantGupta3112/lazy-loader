@@ -4,7 +4,7 @@ from pathlib import Path
 import os
 import ast
 
-from src.lazy_loader.analyzer import normalize_path
+from .analyzer import normalize_path
 
 def bfs(dependency_graph: dict[str, set[str]], local_python_files: list[str]) -> dict[str, set[str]]:    
     chunks = {}
