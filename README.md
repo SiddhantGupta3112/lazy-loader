@@ -1,6 +1,12 @@
 # python-lazy-loader
 
+[![PyPI](https://img.shields.io/pypi/v/lazy-loader-lib)](https://pypi.org/project/lazy-loader-lib/)
+
 A Python import system extension that analyzes a project's module dependency graph at build time, groups related modules into compressed chunks, and intercepts Python's import machinery at runtime to load entire dependency clusters together rather than one file at a time.
+
+```bash
+pip install lazy-loader-lib
+```
 
 ---
 
@@ -11,84 +17,37 @@ When you import a module from a chunked project, the loader transparently:
 1. Intercepts the import via a custom `sys.meta_path` finder
 2. Finds which chunk the requested module belongs to
 3. Decompresses and deserializes the entire chunk from disk
-4. Pre-populates `sys.modules` with all modules in the chunk simultaneously
-5. Executes each module's source in topological order so dependencies are ready before dependants
+4. Pre-populates `sys.modules` with lazy proxy stubs for all modules in the chunk
+5. Executes each module's source on first attribute access in topological order
 
-Subsequent imports of other modules in the same chunk are instant cache hits in `sys.modules` — no disk read, no decompression, no execution overhead.
+Subsequent imports of other modules in the same chunk are instant cache hits in `sys.modules` — no disk read, no decompression, no re-execution.
 
 ---
 
 ## Why this exists
 
-Large Python projects often have modules with heavy initialization — loading model weights, opening database connections, importing large libraries. If these modules are imported one by one as needed, the cold-start cost is spread across many individual import events, each with its own disk read and execution overhead. Grouping related modules into compressed chunks and loading them together amortizes this cost: one disk read, one decompression, all related modules ready.
+Large Python projects often have modules with heavy initialization — loading model weights, opening database connections, importing large libraries. If these modules are imported one by one as needed, the cold-start cost is spread across many individual import events. Grouping related modules into compressed chunks and loading them together amortizes this cost: one disk read, one decompression, all related modules ready simultaneously.
 
-The static dependency graph also makes the project's module relationships explicit and queryable — useful for auditing large codebases, detecting circular imports, and identifying isolated subsystems that could be deployed independently.
-
----
-
-## Tech stack
-
-Python 3.10+, `ast` (stdlib), `pickle` (stdlib), `lz4` for compression. No runtime dependencies beyond lz4.
-
----
-
-## How it works
-
-### Build phase
-
-```
-your_project/
-├── module_a.py     # imports module_b
-├── module_b.py     # imports module_c
-├── module_c.py     # no local imports
-└── isolated.py     # no connections to the above
-```
-
-Running `start("your_project/")` triggers:
-
-1. **Static analysis** — every `.py` file is parsed with `ast`. Import statements are extracted and resolved to local file paths, building a directed dependency graph `{module: set_of_imported_modules}`.
-
-2. **Connected components** — the directed graph is treated as undirected and BFS finds all connected components. Each component becomes one chunk. The above example produces two chunks: `{module_a, module_b, module_c}` and `{isolated}`.
-
-3. **Manual overrides** — any file decorated with `@chunk("name")` is pulled out of its automatic group and placed in the named chunk, regardless of what the graph says. Files in the same named chunk load together. Files in different named chunks stay separate even if the graph connected them.
-
-4. **Topological sort** — within each chunk, modules are ordered so that dependencies appear before dependants. This ensures that when `module_a`'s source is exec'd and tries to import `module_b`, `module_b` is already initialized.
-
-5. **Serialization** — each chunk's source code strings are stored as a dict `{module_name: source_string}`, serialized with `pickle`, compressed with `lz4`, and written to `.chunks/{chunk_id}.chunk`. A `manifest.json` maps every module name to its chunk file.
-
-### Runtime phase
-
-A `ChunkMetaPathFinder` is inserted at the front of `sys.meta_path`. Every `import` statement Python processes goes through it first. If the module name appears in the manifest, the finder returns a `ModuleSpec` pointing at a `ChunkModuleLoader`. Otherwise it returns `None` and Python's normal import machinery handles it.
-
-`ChunkModuleLoader.exec_module` runs when Python needs to initialize the module:
-
-1. Reads the chunk file, decompresses with lz4, deserializes with pickle
-2. Registers `LazySiblingModule` stubs in `sys.modules` for all other modules in the chunk
-3. Executes the requested module's source with `exec(compile(source, filename, 'exec'), module.__dict__)`
-4. Sibling stubs execute their own source on first attribute access via `__getattribute__`
+The static dependency graph also makes module relationships explicit and queryable — useful for auditing large codebases, detecting circular imports, and identifying isolated subsystems.
 
 ---
 
 ## Usage
 
-```bash
-pip install lz4
-```
-
 ```python
 from lazy_loader import start, chunk
 
-# In your project's entry point
+# Call once at your entry point before any project imports
 start("path/to/your/project")
 
-# All imports from this point are intercepted
+# All subsequent imports are intercepted by the loader
 from your_project import heavy_module   # loads entire chunk
-from your_project import sibling        # instant cache hit, already in sys.modules
+from your_project import sibling        # instant -- already in sys.modules
 ```
 
 ### Manual chunk assignment
 
-Place `@chunk("name")` on any function in a file to force that file into a named chunk:
+Place `@chunk("name")` on any function in a file to force that entire file into a named chunk, overriding automatic grouping:
 
 ```python
 # inference_model.py
@@ -96,13 +55,55 @@ from lazy_loader import chunk
 
 @chunk("inference")
 def load():
-    pass   # function body is irrelevant -- decorator is a marker only
+    pass  # function body is irrelevant -- decorator is a static marker only
 
 class Model:
     ...
 ```
 
-Files sharing the same chunk name load together. Files without `@chunk` are grouped automatically by the dependency graph.
+Files sharing the same chunk name load together. Files without `@chunk` are grouped automatically by the dependency graph analyzer.
+
+---
+
+## How it works
+
+### Build phase (`start()` call)
+
+**1 — Static analysis**
+
+Every `.py` file in the target directory is parsed with Python's `ast` module. Import statements (`import x`, `from x import y`, `from . import z`) are extracted and resolved to local file paths, building a directed dependency graph `{module_name: set_of_imported_local_modules}`. External and stdlib imports are ignored — only local project files participate in the graph.
+
+**2 — Connected components**
+
+The directed graph is treated as undirected and BFS finds all connected components. Each component becomes one chunk. Disconnected subgraphs stay in separate chunks and are never loaded together.
+
+```
+module_a → module_b → module_c    # one chunk: {a, b, c}
+isolated                           # separate chunk: {isolated}
+```
+
+**3 — Manual overrides**
+
+The AST scanner finds any function decorated with `@chunk("name")` and moves that entire file into the named chunk, regardless of what automatic analysis concluded. Multiple files can share a chunk name — they all load together.
+
+**4 — Topological sort**
+
+Within each chunk, modules are ordered so that dependencies appear before dependants. This ensures that when a module's source is executed and tries to import a sibling, the sibling's namespace is already initialized.
+
+**5 — Serialization**
+
+Each chunk's source code strings are stored as `{module_name: source_string}`, serialized with `pickle`, compressed with `lz4`, and written to `.chunks/{chunk_id}.chunk`. A `manifest.json` maps every module name to its chunk file.
+
+### Runtime phase (import interception)
+
+A `ChunkMetaPathFinder` is inserted at position 0 in `sys.meta_path`. Every `import` statement Python processes goes through it first. If the module name appears in the manifest, the finder returns a `ModuleSpec` pointing at a `ChunkModuleLoader`. Otherwise it returns `None` and Python's normal import machinery handles it transparently.
+
+`ChunkModuleLoader.exec_module` runs when Python needs to initialize the module:
+
+1. Reads the `.chunk` file, decompresses with lz4, deserializes with pickle
+2. Registers `LazySiblingModule` proxy stubs in `sys.modules` for all modules in the chunk
+3. The requested module itself is morphed into a `LazySiblingModule`
+4. On first attribute access to any module, its source is compiled and exec'd into its namespace
 
 ---
 
@@ -110,26 +111,44 @@ Files sharing the same chunk name load together. Files without `@chunk` are grou
 
 **Why source code instead of serialized module objects**
 
-The natural first approach was to import each module and serialize the live object with `dill`. This failed: dill stores references to classes and functions by recording their module name, then re-imports that module during deserialization to retrieve them. With a custom `sys.meta_path` interceptor installed, that re-import triggered `exec_module` again, which triggered dill deserialization again — infinite recursion. Storing raw source code strings and exec'ing them avoids this entirely: pickle only needs to serialize strings, and exec never touches the import system.
+The natural first approach was to import each module and serialize the live object with `dill`. This failed because dill stores class and function references by recording their originating module name, then re-imports that module during deserialization. With a custom `sys.meta_path` interceptor installed, that re-import triggered `exec_module` again, which triggered dill deserialization again — infinite recursion. Storing raw source code strings and exec'ing them avoids this entirely: pickle only serializes strings, and exec never touches the import system.
 
-**Why siblings pre-register as stubs before any source is exec'd**
+**Why lazy proxy stubs instead of immediate execution**
 
-When `module_a`'s source runs `from module_b import SomeClass`, Python looks up `module_b` in `sys.modules`. If it isn't there, a new import is triggered — which hits the interceptor, which tries to load the chunk again. By pre-registering `LazySiblingModule` stubs for all chunk members before exec'ing any source, all intra-chunk imports resolve to already-registered modules rather than triggering new import cycles.
+An earlier version pre-registered plain `ModuleType` stubs and immediately exec'd all sibling sources before exec'ing the requested module. This worked for linear pipelines but broke on cross-chunk references and complex enterprise topologies where execution order matters in ways the topological sort couldn't fully resolve. `LazySiblingModule` defers each module's source execution until its first attribute is accessed — by which point Python has already set up the full module context and cross-references resolve correctly.
 
-**Why topological order matters**
+**Why `@chunk` operates at file granularity**
 
-If `module_a` exec's before `module_b` but `module_a`'s source does `from module_b import x` at module level, `module_b`'s stub hasn't been exec'd yet and `x` doesn't exist on it. Topological order guarantees independent modules (no imports from others) execute first, so by the time a dependant module runs, all its dependencies have already populated their namespaces.
+Splitting individual functions out of a file would require tracing every name each function transitively references — closures, module-level constants, sibling helpers — and safely exec'ing only a subset of a file's top-level statements. Python's module system has no native concept of partial module loading, and static analysis of Python (a dynamic language) cannot reliably determine which names a function actually needs at runtime. File-level granularity keeps the analysis tractable and the behavior predictable. If finer splitting is needed, the correct approach is restructuring source files.
 
-**Why `@chunk` operates at file granularity, not function granularity**
+**Why topological sort within chunks**
 
-Splitting individual functions out of a file would require tracing every name each function transitively references — closures, module-level constants, sibling helpers — and exec'ing only a subset of a file's top-level statements safely. Python's module system has no native concept of partial module loading. File-level granularity keeps the analysis tractable and the behavior predictable. If finer splitting is needed, the correct approach is restructuring source files.
+If module A exec's before module B but A's source does `from B import x` at module level, B's stub hasn't been exec'd yet and `x` doesn't exist on it. Topological order guarantees that independent modules (no imports from others) execute first so by the time a dependant module runs, all its dependencies have already populated their namespaces.
 
 ---
 
 ## Known limitations
 
-Relative imports are supported for `from .module import x` and `from ..module import x` patterns. Bare `from . import x` (where `x` is a name defined inside `__init__.py` rather than a separate file) is handled by checking whether a matching `.py` file exists; if not, the edge is silently omitted, which is correct behavior since there is no file to chunk.
+**Performance** — benchmarks show the current implementation is not faster than standard Python imports for small to medium projects. The compression/decompression overhead and proxy indirection currently outweigh the benefits of co-loading. Optimization is planned as a future iteration — the architecture is sound, the implementation needs profiling and tuning.
 
-The `LazySiblingModule` defers sibling execution until first attribute access. If a sibling's source has a runtime error, it surfaces as an `AttributeError` on the first attribute accessed rather than as a clear import error — harder to debug than an immediate failure.
+**Relative imports** — `from . import x` where `x` is a name defined inside `__init__.py` rather than a separate file is handled by checking whether a matching `.py` file exists. If not, the edge is silently omitted. Same-package explicit module references (`from .module import x`) are fully supported.
 
-Module-level side effects (print statements, file writes, network calls at import time) execute when the chunk loads, not when that specific module is first imported. This matches standard Python behavior but may be surprising if side effects were expected to be deferred.
+**Sibling error reporting** — `LazySiblingModule` defers execution until first attribute access. If a sibling's source has a runtime error, it surfaces as an `AttributeError` on the first attribute accessed rather than as a clear import error. This makes debugging sibling module errors harder than standard Python import errors.
+
+**Module-level side effects** — print statements, file writes, or network calls at module level execute when the chunk first loads any member, not when that specific module is first imported. This matches standard Python behavior for eager imports but may be surprising if side effects were expected to be strictly deferred.
+
+---
+
+## Project structure
+
+```
+lazy-loader-lib/
+├── lazy_loader/
+│   ├── __init__.py      # exports: start, chunk
+│   ├── analyzer.py      # AST parser, dependency graph, topological sort
+│   ├── chunker.py       # BFS connected components, decorator scanner, chunk assignment
+│   ├── decorators.py    # @chunk runtime decorator and registry
+│   ├── importer.py      # ChunkMetaPathFinder, ChunkModuleLoader, LazySiblingModule
+│   └── loader.py        # build_chunks, install_loader, start
+└── sample_project/      # test fixtures across five dependency topologies
+```

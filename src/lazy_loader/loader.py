@@ -71,6 +71,5 @@ def start(base_dir: str | Path):
     if not os.path.exists(manifest_path):
         build_chunks(base_dir)
     
-    build_chunks(base_dir)
     install_loader(base_dir)
         
